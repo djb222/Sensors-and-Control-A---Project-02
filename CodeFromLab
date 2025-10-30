@@ -1,0 +1,602 @@
+
+
+import time
+import math
+import threading
+import roslibpy
+import pyrealsense2 as rs
+import numpy as np
+import cv2
+
+
+
+# Camera position relative to robot BASE origin (metres)
+CAMERA_DISTANCE_M = 0.55   # along +X_base from robot origin to camera
+CAMERA_Y_OFFSET_M = 0.00   # lateral offset (+Y left, -Y right)
+CAMERA_HEIGHT_M   = 0.055  # camera height above table plane
+
+# RealSense optical -> robot BASE mapping for a front-facing camera looking toward the robot:
+#   Camera optical: X right, Y down, Z forward (toward scene)
+#   Robot base:     X forward (into workspace), Y left/right, Z up
+# Mapping:
+#   X_base = -Z_cam
+#   Y_base = +X_cam   (flip to -X_cam if your Y goes the wrong way)
+#   Z_base = -Y_cam
+R_MAP = np.array([[ 0.0,  0.0, -1.0],
+                  [ 1.0,  0.0,  0.0],
+                  [ 0.0, -1.0,  0.0]], dtype=float)
+
+t_cam_in_base = np.array([CAMERA_DISTANCE_M, CAMERA_Y_OFFSET_M, CAMERA_HEIGHT_M], dtype=float)
+
+# Table and approach
+TABLE_Z_M          = 0.020   # measured table height in BASE frame (m)
+APPROACH_CLEAR_M   = 0.10    # hover 10 cm above the contact surface
+TOUCH_OFFSET_M     = 0.015   # stop this far ABOVE the surface (no plunge)
+SAFETY_Z_FLOOR_M   = TABLE_Z_M + 0.020   # never descend below this (20 mm above table)
+MAX_DESCENT_M      = 0.080   # never descend more than 8 cm from hover in a single step
+HOVER_MIN_M        = TABLE_Z_M + 0.090   # minimum hover (keeps a healthy buffer)
+HOVER_MAX_M        = 0.22                 # cap hover to keep within reachable vertical envelope
+
+# Workspace clamps (tune to your robot)
+X_MIN, X_MAX = 0.05, 0.35
+Y_MIN, Y_MAX = -0.25, 0.25
+Z_MIN, Z_MAX = 0.01, 0.25
+
+# Lateral place direction relative to current Y:
+#   -1.0 = move "left" (negative Y), +1.0 = move "right" (positive Y)
+PLACE_Y_SIGN  = +1.0
+PLACE_Y_DELTA = 0.15    # metres of lateral shift during place
+
+# Blue object detection (HSV)
+BLUE_H_LO = (100,  60,  50)   # lower bound H,S,V
+BLUE_H_HI = (130, 255, 255)   # upper bound H,S,V
+BLUE_MIN_AREA = 600           # area threshold to ignore speckles
+
+# Obstruction detection
+OBSTACLE_MIN_HEIGHT = 0.025   # metres above table to consider "tall" (wallet on top)
+TOP_SAMPLE_WIN      = 7       # odd number of pixels for top-Z window (e.g., 5 or 7)
+
+# If your gripper wiring semantics feel inverted, flip these two lines:
+TOOL_STATE_CLOSE  = [1, 1]  # pump ON, gripper CLOSE  (swap with CLOSE if reversed in your setup)
+TOOL_STATE_OPEN = [1, 0]  # pump ON, gripper OPEN
+
+
+# =========================
+# Math / message helpers
+# =========================
+def cam_to_base(p_cam_xyz):
+    """Map camera 3D (RealSense optical frame) to robot BASE frame."""
+    return R_MAP @ np.asarray(p_cam_xyz, dtype=float) + t_cam_in_base
+
+
+def quaternion_from_euler(roll, pitch, yaw):
+    cr = math.cos(roll * 0.5);  sr = math.sin(roll * 0.5)
+    cp = math.cos(pitch * 0.5); sp = math.sin(pitch * 0.5)
+    cy = math.cos(yaw * 0.5);   sy = math.sin(yaw * 0.5)
+    w = cr * cp * cy + sr * sp * sy
+    x = sr * cp * cy - cr * sp * sy
+    y = cr * sp * cy + sr * cp * sy
+    z = cr * cp * sy - sr * sp * cy
+    return x, y, z, w
+
+
+def make_joint_traj_msg(positions, duration_sec=1.0, joint_names=None):
+    if not joint_names:
+        joint_names = ['joint_1', 'joint_2', 'joint_3', 'joint_4']
+    secs = int(duration_sec)
+    nsecs = int((duration_sec - secs) * 1e9)
+    return {
+        'header': {'stamp': {'secs': 0, 'nsecs': 0}, 'frame_id': ''},
+        'joint_names': joint_names,
+        'points': [{
+            'positions': list(positions),
+            'velocities': [],
+            'accelerations': [],
+            'effort': [],
+            'time_from_start': {'secs': secs, 'nsecs': nsecs}
+        }]
+    }
+
+
+def make_pose_msg(xyz, rpy=(0.0, 0.0, 0.0)):
+    qx, qy, qz, qw = quaternion_from_euler(rpy[0], rpy[1], rpy[2])
+    return {
+        'position': {'x': float(xyz[0]), 'y': float(xyz[1]), 'z': float(xyz[2])},
+        'orientation': {'x': qx, 'y': qy, 'z': qz, 'w': qw}
+    }
+
+
+# =========================
+# Dobot ROS client
+# =========================
+class DobotClient:
+    def __init__(self, host='192.168.27.1', port=9090):
+        self.ros = roslibpy.Ros(host=host, port=port)
+        self._safety = None
+        self._ee_lock = threading.Lock()
+        self._ee_pos_base = None  # np.array([x, y, z])
+
+        # Publishers
+        self.pub_joint = roslibpy.Topic(self.ros, '/dobot_magician/target_joint_states', 'trajectory_msgs/JointTrajectory')
+        self.pub_pose  = roslibpy.Topic(self.ros, '/dobot_magician/target_end_effector_pose', 'geometry_msgs/Pose')
+        self.pub_safety= roslibpy.Topic(self.ros, '/dobot_magician/target_safety_status', 'std_msgs/Int32')
+        self.pub_tool  = roslibpy.Topic(self.ros, '/dobot_magician/target_tool_state', 'std_msgs/Int32MultiArray')
+
+        # Subscribers
+        self.sub_safety = roslibpy.Topic(self.ros, '/dobot_magician/safety_status', 'std_msgs/Int32')
+        self.sub_ee_pose = roslibpy.Topic(self.ros, '/dobot_magician/end_effector_poses', 'geometry_msgs/PoseStamped')
+
+    def connect(self, timeout=8.0):
+        self.ros.run()
+        t0 = time.time()
+        while not self.ros.is_connected and (time.time() - t0) < timeout:
+            time.sleep(0.05)
+        if not self.ros.is_connected:
+            raise RuntimeError('Failed to connect to ROSBridge')
+
+        self.pub_joint.advertise()
+        self.pub_pose.advertise()
+        self.pub_safety.advertise()
+        self.pub_tool.advertise()
+
+        self.sub_safety.subscribe(self._on_safety)
+        self.sub_ee_pose.subscribe(self._on_ee_pose)
+
+    def close(self):
+        try: self.sub_safety.unsubscribe()
+        except: pass
+        try: self.sub_ee_pose.unsubscribe()
+        except: pass
+        for t in (self.pub_joint, self.pub_pose, self.pub_safety, self.pub_tool):
+            try: t.unadvertise()
+            except: pass
+        try: self.ros.terminate()
+        except: pass
+
+    def _on_safety(self, msg):
+        try: self._safety = int(msg.get('data', -1))
+        except: self._safety = -1
+
+    def _on_ee_pose(self, msg):
+        try:
+            if 'pose' in msg:
+                pos = msg['pose']['position']
+            elif 'position' in msg:
+                pos = msg['position']
+            else:
+                return
+            p = np.array([float(pos['x']), float(pos['y']), float(pos['z'])], dtype=float)
+            with self._ee_lock:
+                self._ee_pos_base = p
+        except Exception:
+            pass
+
+    def ensure_operating(self, timeout=25.0):
+        self.pub_safety.publish(roslibpy.Message({'data': 2}))  # INITIALISING (home)
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            if self._safety == 4:
+                return True
+            time.sleep(0.1)
+        return False
+
+    def get_ee_pos_base(self):
+        with self._ee_lock:
+            return None if self._ee_pos_base is None else self._ee_pos_base.copy()
+
+    # Commands
+    def move_joints(self, positions, duration_sec=1.0):
+        self.pub_joint.publish(roslibpy.Message(make_joint_traj_msg(positions, duration_sec)))
+
+    def move_ee_pose(self, xyz, rpy=(0.0, 0.0, 0.0)):
+        self.pub_pose.publish(roslibpy.Message(make_pose_msg(xyz, rpy)))
+
+    def tool_on_open(self):  # pump ON, gripper OPEN
+        self.pub_tool.publish(roslibpy.Message({'data': TOOL_STATE_OPEN}))
+
+    def tool_on_close(self): # pump ON, gripper CLOSE
+        self.pub_tool.publish(roslibpy.Message({'data': TOOL_STATE_CLOSE}))
+
+    def tool_off(self):
+        self.pub_tool.publish(roslibpy.Message({'data': [0, 0]}))
+
+
+# =========================
+# Vision / detection
+# =========================
+class BlackBoxDetector:
+    def __init__(self):
+        self.pipeline = rs.pipeline()
+        self.config = rs.config()
+        self.config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+        self.config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+        self.profile = self.pipeline.start(self.config)
+        self.intr = self.profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
+        self.align = rs.align(rs.stream.color)
+        # thresholds
+        self.min_box_area = 1000
+        self.max_box_area = 50000
+        self.aspect_ratio_threshold = 0.3
+
+    def get_frames(self):
+        frames = self.pipeline.wait_for_frames()
+        aligned = self.align.process(frames)
+        cf = aligned.get_color_frame()
+        df = aligned.get_depth_frame()
+        if not cf or not df:
+            return None, None, None, None
+        color = np.asanyarray(cf.get_data())
+        depth = np.asanyarray(df.get_data())
+        return color, depth, cf, df
+
+    def detect_black_box(self, color_image, depth_frame):
+        """Return (cx, cy, depth_m, contour, (x,y,w,h)) or None."""
+        gray = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
+        _, mask = cv2.threshold(gray, 50, 255, cv2.THRESH_BINARY_INV)
+        kernel = np.ones((5, 5), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        best, best_score = None, 0
+        for c in contours:
+            area = cv2.contourArea(c)
+            if area < self.min_box_area or area > self.max_box_area:
+                continue
+            eps = 0.02 * cv2.arcLength(c, True)
+            approx = cv2.approxPolyDP(c, eps, True)
+            if len(approx) >= 4:
+                x, y, w, h = cv2.boundingRect(c)
+                aspect = min(w, h) / max(w, h)
+                if aspect < self.aspect_ratio_threshold:
+                    continue
+                cx, cy = x + w // 2, y + h // 2
+                d = depth_frame.get_distance(cx, cy)
+                if d > 0:
+                    rectangularity = area / (w * h)
+                    score = area * rectangularity
+                    if score > best_score:
+                        best_score = score
+                        best = (cx, cy, d, c, (x, y, w, h))
+        return best
+
+    def detect_blue_pack(self, color_image, depth_frame):
+        """Detect a blue object (e.g., gum pack). Return same tuple form or None."""
+        hsv = cv2.cvtColor(color_image, cv2.COLOR_BGR2HSV)
+        lower = np.array(BLUE_H_LO, dtype=np.uint8)
+        upper = np.array(BLUE_H_HI, dtype=np.uint8)
+        mask = cv2.inRange(hsv, lower, upper)
+        kernel = np.ones((5, 5), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+        c = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(c) < BLUE_MIN_AREA:
+            return None
+        x, y, w, h = cv2.boundingRect(c)
+        cx, cy = x + w // 2, y + h // 2
+        d = depth_frame.get_distance(cx, cy)
+        if d <= 0:
+            return None
+        return (cx, cy, d, c, (x, y, w, h))
+
+    def pixel_to_cam(self, px, py, depth_m):
+        """deproject pixel to camera 3D (metres) in camera optical frame."""
+        return np.array(rs.rs2_deproject_pixel_to_point(self.intr, [px, py], depth_m), dtype=float)
+
+
+# =========================
+# Z measurement and planning
+# =========================
+def measure_top_z_base(det: BlackBoxDetector, depth_frame, cx, cy, win=TOP_SAMPLE_WIN):
+    """
+    Sample a small window of depths around (cx, cy), deproject to camera 3D,
+    transform to BASE, and return a robust estimate (median) of the top surface Z in BASE.
+    """
+    half = win // 2
+    zs = []
+    for dy in range(-half, half + 1):
+        for dx in range(-half, half + 1):
+            u, v = int(cx + dx), int(cy + dy)
+            d = depth_frame.get_distance(u, v)
+            if d <= 0:
+                continue
+            p_cam = det.pixel_to_cam(u, v, d)
+            p_base = cam_to_base(p_cam)
+            zs.append(p_base[2])
+    if not zs:
+        return None
+    return float(np.median(zs))
+
+
+def _clamp_hover_touch(hover_z, touch_z):
+    """Apply global Z safety rules."""
+    # enforce hover band
+    hover_z = min(HOVER_MAX_M, max(HOVER_MIN_M, hover_z))
+    # touch must be above floor and not too far below hover
+    touch_floor = max(SAFETY_Z_FLOOR_M, Z_MIN)
+    touch_z = max(touch_floor, min(Z_MAX, touch_z))
+    if hover_z - touch_z > MAX_DESCENT_M:
+        touch_z = hover_z - MAX_DESCENT_M
+    # Ensure touch < hover
+    touch_z = min(touch_z, hover_z - 0.005)
+    return hover_z, touch_z
+
+
+def plan_pick_targets_from_surface(x_base, y_base, surface_z):
+    """
+    Build hover/touch from a measured surface height (e.g., wallet top).
+    We stop ABOVE the surface (TOUCH_OFFSET_M), not into it.
+    """
+    base_xy = np.array([
+        max(X_MIN, min(X_MAX, x_base)),
+        max(Y_MIN, min(Y_MAX, y_base))
+    ], dtype=float)
+
+    raw_hover_z = surface_z + APPROACH_CLEAR_M
+    raw_touch_z = surface_z + max(0.0, TOUCH_OFFSET_M)
+
+    hover_z, touch_z = _clamp_hover_touch(raw_hover_z, raw_touch_z)
+    return (np.array([base_xy[0], base_xy[1], hover_z]),
+            np.array([base_xy[0], base_xy[1], touch_z]))
+
+
+def plan_pick_targets_from_table(x_base, y_base):
+    """
+    Build hover/touch from table height (for base object on the table).
+    We stop ABOVE the table (never below SAFETY_Z_FLOOR_M).
+    """
+    base_xy = np.array([
+        max(X_MIN, min(X_MAX, x_base)),
+        max(Y_MIN, min(Y_MAX, y_base))
+    ], dtype=float)
+
+    raw_hover_z = TABLE_Z_M + APPROACH_CLEAR_M
+    raw_touch_z = TABLE_Z_M + max(0.020, TOUCH_OFFSET_M)  # ensure at least 20 mm above table
+
+    hover_z, touch_z = _clamp_hover_touch(raw_hover_z, raw_touch_z)
+    return (np.array([base_xy[0], base_xy[1], hover_z]),
+            np.array([base_xy[0], base_xy[1], touch_z]))
+
+
+# =========================
+# Pick/place routines
+# =========================
+def place_lateral_targets(hover, touch):
+    """
+    Compute lateral place positions from current hover/touch using PLACE_Y_SIGN/DELTA.
+    """
+    place_hover = hover.copy(); place_hover[1] = max(Y_MIN, min(Y_MAX, hover[1] + PLACE_Y_SIGN * PLACE_Y_DELTA))
+    place_touch = touch.copy(); place_touch[1] = place_hover[1]
+    # Keep Z rules consistent for place
+    place_hover[2], place_touch[2] = _clamp_hover_touch(place_hover[2], place_touch[2])
+    return place_hover, place_touch
+
+
+def pick_at_surface_and_drop(robot: DobotClient, hover, touch, place_hover, place_touch):
+    """
+    Enforced sequence:
+      ABOVE(hover) -> OPEN -> DOWN(touch) -> CLOSE -> UP(hover) -> LATERAL(place_hover)
+      -> DOWN(place_touch) -> OPEN -> UP(place_hover)
+    """
+    # ABOVE
+    robot.move_ee_pose(hover.tolist()); time.sleep(1.2)
+    # OPEN
+    robot.tool_on_open();               time.sleep(0.6)
+    # DOWN
+    robot.move_ee_pose(touch.tolist()); time.sleep(0.9)
+    # CLOSE
+    robot.tool_on_close();              time.sleep(1.0)
+    # UP
+    robot.move_ee_pose(hover.tolist()); time.sleep(1.0)
+    # LATERAL (hover)
+    robot.move_ee_pose(place_hover.tolist()); time.sleep(1.0)
+    # DOWN to place
+    robot.move_ee_pose(place_touch.tolist()); time.sleep(0.8)
+    # OPEN (release)
+    robot.tool_on_open();               time.sleep(0.6)
+    # UP
+    robot.move_ee_pose(place_hover.tolist()); time.sleep(0.8)
+
+
+def pick_and_place_base_object(robot: DobotClient, x_base, y_base):
+    """
+    Standard pick & place of the base object at table height.
+    """
+    hover, touch = plan_pick_targets_from_table(x_base, y_base)
+    if not (X_MIN < hover[0] < X_MAX and Y_MIN < hover[1] < Y_MAX):
+        print("Target XY outside workspace; aborting base pick.")
+        return
+    place_hover, place_touch = place_lateral_targets(hover, touch)
+    try:
+        print(f"[Base Pick] hover={hover}, touch={touch}")
+        pick_at_surface_and_drop(robot, hover, touch, place_hover, place_touch)
+        robot.move_joints([0.0, 0.2, 0.4, 0.0], duration_sec=1.2); time.sleep(1.0)
+        robot.tool_off()
+        print("Base object pick & place complete.")
+    except Exception as e:
+        print(f"Base pick failed: {e}")
+        try:
+            robot.tool_off()
+            robot.move_joints([0.0, 0.2, 0.4, 0.0], duration_sec=1.0)
+        except:
+            pass
+
+
+def preclear_then_pick(robot: DobotClient, x_base, y_base, top_surface_z):
+    """
+    Pre-clear a tall item (wallet) at measured top Z, drop it, return, then pick base object.
+    """
+    # 1) Pick the top item at its top surface height (ABOVE -> OPEN -> DOWN -> CLOSE -> UP -> PLACE -> OPEN -> UP)
+    hover_top, touch_top = plan_pick_targets_from_surface(x_base, y_base, top_surface_z)
+    if not (X_MIN < hover_top[0] < X_MAX and Y_MIN < hover_top[1] < Y_MAX):
+        print("Top-item XY outside workspace; aborting pre-clear.")
+        return
+    place_h, place_t = place_lateral_targets(hover_top, touch_top)
+
+    try:
+        print(f"[Pre-clear] top_hover={hover_top}, top_touch={touch_top}")
+        pick_at_surface_and_drop(robot, hover_top, touch_top, place_h, place_t)
+
+        # 2) Return above original XY at table hover, then pick base object
+        hover_table, _ = plan_pick_targets_from_table(x_base, y_base)
+        robot.move_ee_pose(hover_table.tolist()); time.sleep(0.8)
+        pick_and_place_base_object(robot, x_base, y_base)
+
+    except Exception as e:
+        print(f"Pre-clear failed: {e}")
+        try:
+            robot.tool_off()
+            robot.move_joints([0.0, 0.2, 0.4, 0.0], duration_sec=1.0)
+        except:
+            pass
+
+
+# =========================
+# Main
+# =========================
+def main():
+    print("Starting camera-guided Dobot pick & place")
+
+    # Camera
+    det = BlackBoxDetector()
+
+    # Robot
+    robot = None
+    robot_connected = False
+    try:
+        robot = DobotClient(host='192.168.27.1', port=9090)
+        robot.connect()
+        if not robot.ensure_operating():
+            print("Warning: could not confirm OPERATING(4); continuing.")
+        robot.move_joints([0.0, 0.2, 0.4, 0.0], duration_sec=1.0); time.sleep(1.0)
+        robot_connected = True
+        print("Robot ready.")
+    except Exception as e:
+        print(f"Robot setup failed: {e}. Camera-only mode.")
+
+    last_action_t = 0.0
+    cooldown_s = 2.0
+
+    try:
+        while True:
+            color, depth_img, cf, df = det.get_frames()
+            if color is None:
+                continue
+
+            # Detect both targets
+            hit_black = det.detect_black_box(color, df)
+            hit_blue  = det.detect_blue_pack(color, df)
+
+            disp = color.copy()
+            chosen = None
+            chosen_name = None
+
+            # Draw overlays, pick one target (black preferred by default)
+            if hit_black:
+                cx, cy, d, contour, (x, y, w, h) = hit_black
+                cv2.drawContours(disp, [contour], -1, (0, 255, 0), 3)
+                cv2.rectangle(disp, (x, y), (x+w, y+h), (255, 0, 0), 2)
+                cv2.circle(disp, (cx, cy), 5, (0, 0, 255), -1)
+                chosen = hit_black
+                chosen_name = "black"
+
+            if hit_blue:
+                cx, cy, d, contour, (x, y, w, h) = hit_blue
+                cv2.drawContours(disp, [contour], -1, (255, 255, 0), 3)
+                cv2.rectangle(disp, (x, y), (x+w, y+h), (0, 165, 255), 2)
+                cv2.circle(disp, (cx, cy), 5, (255, 0, 0), -1)
+                if chosen is None:
+                    chosen = hit_blue
+                    chosen_name = "blue"
+
+            if chosen:
+                cx, cy, depth_m, _, (x, y, w, h) = chosen
+                # Pixel->cam->base
+                p_cam  = det.pixel_to_cam(cx, cy, depth_m)     # [Xc, Yc, Zc]
+                p_base = cam_to_base(p_cam)                    # [Xb, Yb, Zb] absolute
+
+                # Use XY from base for planning; Z uses table height unless obstruction detected
+                rx, ry = float(p_base[0]), float(p_base[1])
+
+                cv2.putText(disp, f"Target({chosen_name}) base XY=({rx:.3f},{ry:.3f}) depth={depth_m:.3f}m",
+                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0,255,0), 2)
+
+                # Debug vector EE->Target
+                if robot_connected:
+                    ee = robot.get_ee_pos_base()
+                    if ee is not None:
+                        vec = p_base - ee
+                        print(f"[EE->TARGET:{chosen_name}] d={vec.round(3)}  TARGET(base)={p_base.round(3)}  EE(base)={ee.round(3)}")
+
+                # Decide action
+                now = time.time()
+                if robot_connected and (now - last_action_t > cooldown_s):
+                    if X_MIN < rx < X_MAX and Y_MIN < ry < Y_MAX:
+                        # Measure top Z at the target to see if a tall object sits on top
+                        top_z = measure_top_z_base(det, df, cx, cy, TOP_SAMPLE_WIN)
+                        if top_z is not None:
+                            height_above_table = top_z - TABLE_Z_M
+                            print(f"Measured top Z={top_z:.3f} m (h above table={height_above_table:.3f} m)")
+                        else:
+                            height_above_table = 0.0
+
+                        if (top_z is not None) and (height_above_table > OBSTACLE_MIN_HEIGHT):
+                            print("Tall item detected on top; pre-clearing.")
+                            preclear_then_pick(robot, rx, ry, top_z)
+                        else:
+                            print("Picking base object at table height.")
+                            pick_and_place_base_object(robot, rx, ry)
+
+                        last_action_t = now
+                    else:
+                        print(f"Target outside workspace clamps: x={rx:.3f}, y={ry:.3f}")
+                else:
+                    rem = max(0, cooldown_s - (now - last_action_t))
+                    if rem > 0:
+                        cv2.putText(disp, f"Cooldown {rem:.1f}s", (10, 60),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
+            else:
+                cv2.putText(disp, "Searching for black or blue object...", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
+
+            # Show windows
+            cv2.imshow("Detection", disp)
+            gray = cv2.cvtColor(color, cv2.COLOR_BGR2GRAY)
+            _, dbg = cv2.threshold(gray, 50, 255, cv2.THRESH_BINARY_INV)
+            cv2.imshow("Black Mask (debug)", dbg)
+
+            # Keys
+            k = cv2.waitKey(1) & 0xFF
+            if k == ord('q'):
+                break
+            elif k == ord('p') and chosen and robot_connected:
+                # Manual: perform the same logic once
+                p_cam = det.pixel_to_cam(chosen[0], chosen[1], chosen[2])
+                p_base = cam_to_base(p_cam)
+                rx, ry = float(p_base[0]), float(p_base[1])
+                top_z = measure_top_z_base(det, df, chosen[0], chosen[1], TOP_SAMPLE_WIN)
+                if top_z is not None and (top_z - TABLE_Z_M) > OBSTACLE_MIN_HEIGHT:
+                    preclear_then_pick(robot, rx, ry, top_z)
+                else:
+                    pick_and_place_base_object(robot, rx, ry)
+                last_action_t = time.time()
+            elif k == ord('r') and robot_connected:
+                if robot.ensure_operating():
+                    robot.move_joints([0.0, 0.2, 0.4, 0.0], duration_sec=1.0)
+
+    except Exception as e:
+        print(f"Error: {e}")
+
+    finally:
+        det.pipeline.stop()
+        if robot_connected and robot is not None:
+            robot.close()
+        cv2.destroyAllWindows()
+        print("Stopped.")
+
+
+if __name__ == "__main__":
+    main()
