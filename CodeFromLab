@@ -1,5 +1,3 @@
-
-
 import time
 import math
 import threading
@@ -7,8 +5,6 @@ import roslibpy
 import pyrealsense2 as rs
 import numpy as np
 import cv2
-
-
 
 # Camera position relative to robot BASE origin (metres)
 CAMERA_DISTANCE_M = 0.55   # along +X_base from robot origin to camera
